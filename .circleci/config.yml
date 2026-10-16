@@ -1,0 +1,154 @@
+version: 2.1
+
+orbs:
+  python: circleci/python@2.1.1
+
+jobs:
+  lint:
+    docker:
+      - image: cimg/python:3.12
+    steps:
+      - checkout
+      - python/install-packages:
+          pkg-manager: pip
+          pip-dependency-file: requirements-dev.txt
+      - run:
+          name: Run Ruff Linter
+          command: ruff check .
+
+  unit-tests:
+    docker:
+      - image: cimg/python:3.12
+        environment:
+          DATABASE_URL: postgresql://imagequeue:local_dev_password@localhost:5432/imagequeue
+          REDIS_URL: redis://localhost:6379/0
+      - image: cimg/postgres:16.6
+        environment:
+          POSTGRES_DB: imagequeue
+          POSTGRES_USER: imagequeue
+          POSTGRES_PASSWORD: local_dev_password
+      - image: cimg/redis:7.4
+    steps:
+      - checkout
+      - python/install-packages:
+          pkg-manager: pip
+          pip-dependency-file: requirements-dev.txt
+      - run:
+          name: Install PostgreSQL Client
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client
+      - run:
+          name: Wait for PostgreSQL
+          command: |
+            for i in $(seq 1 60); do
+              if pg_isready -h localhost -p 5432 -U imagequeue; then
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "PostgreSQL did not become ready"
+            exit 1
+      - run:
+          name: Initialize Database
+          command: |
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_schema.sql
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/002_seed.sql
+      - run:
+          name: Run Unit Tests
+          command: pytest test_jobs.py -v
+
+  integration-tests:
+    docker:
+      - image: cimg/python:3.12
+        environment:
+          DATABASE_URL: postgresql://imagequeue:local_dev_password@localhost:5432/imagequeue
+          REDIS_URL: redis://localhost:6379/0
+      - image: cimg/postgres:16.6
+        environment:
+          POSTGRES_DB: imagequeue
+          POSTGRES_USER: imagequeue
+          POSTGRES_PASSWORD: local_dev_password
+      - image: cimg/redis:7.4
+    steps:
+      - checkout
+      - python/install-packages:
+          pkg-manager: pip
+          pip-dependency-file: requirements-dev.txt
+
+      - run:
+          name: Install PostgreSQL Client
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client
+
+      - run:
+          name: Wait for PostgreSQL
+          command: |
+            for i in $(seq 1 60); do
+              if pg_isready -h localhost -p 5432 -U imagequeue; then
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "PostgreSQL did not become ready"
+            exit 1
+
+      - run:
+          name: Apply Database Migrations
+          command: |
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_schema.sql
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/002_seed.sql
+
+      - run:
+          name: Verify Jobs Table
+          command: |
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "\dt jobs"
+
+      - run:
+          name: Run Integration Tests
+          command: pytest test_api.py test_jobs.py -v
+
+  secret-scan:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - run:
+          name: Install Gitleaks
+          command: |
+            curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz \
+              | tar -xz gitleaks
+      - run:
+          name: Scan Repository for Secrets
+          command: ./gitleaks detect --source . --redact --verbose
+
+  docker-build:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Build Docker Image
+          command: |
+            docker build -t image-queue:$CIRCLE_SHA1 .
+
+workflows:
+  ci:
+    jobs:
+      - lint
+
+      - unit-tests
+
+      - integration-tests:
+          requires:
+            - unit-tests
+
+      - secret-scan
+
+      - docker-build:
+          requires:
+            - integration-tests
+            - lint
+            - secret-scan
