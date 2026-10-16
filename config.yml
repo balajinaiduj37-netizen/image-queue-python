@@ -1,0 +1,107 @@
+version: 2.1
+
+orbs:
+  python: circleci/python@2.1.1
+
+jobs:
+  lint:
+    docker:
+      - image: cimg/python:3.12
+    steps:
+      - checkout
+      - run:
+          name: Install ruff
+          command: pip install ruff==0.5.0
+      - run:
+          name: Lint
+          command: ruff check .
+
+  unit-tests:
+    docker:
+      - image: cimg/python:3.12
+    steps:
+      - checkout
+      - python/install-packages:
+          pkg-manager: pip
+          pip-dependency-file: requirements-dev.txt
+      - run:
+          name: Unit tests (no database, no network)
+          command: pytest tests/unit --cov=app.jobs --cov-report=term-missing --cov-fail-under=70
+
+  integration-tests:
+    docker:
+      - image: cimg/python:3.12
+      # Service containers share localhost with the primary container.
+      - image: postgres:16.6-alpine
+        environment:
+          POSTGRES_DB: imagequeue
+          POSTGRES_USER: imagequeue
+          POSTGRES_PASSWORD: local_dev_password
+      - image: redis:7.4.2-alpine
+    environment:
+      DATABASE_URL: postgresql://imagequeue:local_dev_password@localhost:5432/imagequeue
+      REDIS_URL: redis://localhost:6379/0
+    steps:
+      - checkout
+      - python/install-packages:
+          pkg-manager: pip
+          pip-dependency-file: requirements-dev.txt
+      - run:
+          name: Full suite with coverage (migrations applied by tests/integration/conftest.py)
+          command: pytest --cov=app --cov-report=term-missing --cov-fail-under=70
+
+  secret-scan:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - run:
+          name: Install gitleaks
+          command: |
+            curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz \
+              | tar -xz gitleaks
+      - run:
+          name: Scan repository history for secrets
+          command: ./gitleaks detect --source . --redact --verbose
+
+  docker-build:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Build image
+          command: docker build -t image-queue:$CIRCLE_SHA1 -t image-queue:1.0 .
+
+  docker-push:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Build, tag and push to Docker Hub
+          command: |
+            IMAGE="$DOCKERHUB_USERNAME/image-queue:1.0"
+            docker build -t "$IMAGE" .
+            echo "$DOCKERHUB_PASSWORD" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+            docker push "$IMAGE"
+
+workflows:
+  ci:
+    jobs:
+      - lint
+      - unit-tests:
+          requires: [lint]
+      - integration-tests:
+          requires: [unit-tests]
+      - secret-scan:
+          requires: [integration-tests]
+      - docker-build:
+          requires: [secret-scan]
+      - docker-push:
+          requires: [docker-build]
+          filters:
+            branches:
+              only: main

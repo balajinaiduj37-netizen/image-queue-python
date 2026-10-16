@@ -1,0 +1,16 @@
+Put your files like this (uploaded files go into app/ and migrations/):
+
+.circleci/config.yml
+.dockerignore
+.gitignore            <- your uploaded _gitignore, renamed
+Dockerfile
+docker-compose.yml
+pytest.ini
+requirements.txt
+requirements-dev.txt
+ruff.toml
+README.md             <- your README plus README_ADDITIONS.md
+app/__init__.py  cache.py  db.py  jobs.py  main.py  queue.py  worker.py
+migrations/001_schema.sql  002_seed.sql
+tests/unit/test_jobs.py
+tests/integration/conftest.py  test_api.py

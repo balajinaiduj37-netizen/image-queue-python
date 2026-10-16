@@ -1,0 +1,12 @@
+.git
+.circleci
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.coverage
+tests
+docs
+*.md
+docker-compose.yml
