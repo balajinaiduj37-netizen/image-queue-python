@@ -168,8 +168,8 @@ workflows:
       equal: [ staging, << pipeline.git.branch >> ]
     jobs:
       - build-and-push:
-          name: build-and-push-stage
-          moving-tag: stage
+          name: build-and-push-staging
+          moving-tag: staging
 
   prod-pipeline:
     when:
