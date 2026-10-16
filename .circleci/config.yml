@@ -75,13 +75,11 @@ jobs:
       - python/install-packages:
           pkg-manager: pip
           pip-dependency-file: requirements-dev.txt
-
       - run:
           name: Install PostgreSQL Client
           command: |
             sudo apt-get update
             sudo apt-get install -y postgresql-client
-
       - run:
           name: Wait for PostgreSQL
           command: |
@@ -93,18 +91,15 @@ jobs:
             done
             echo "PostgreSQL did not become ready"
             exit 1
-
       - run:
           name: Apply Database Migrations
           command: |
             psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_schema.sql
             psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/002_seed.sql
-
       - run:
           name: Verify Jobs Table
           command: |
             psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "\dt jobs"
-
       - run:
           name: Run Integration Tests
           command: pytest test_api.py test_jobs.py -v
@@ -123,7 +118,10 @@ jobs:
           name: Scan Repository for Secrets
           command: ./gitleaks detect --source . --redact --verbose
 
-  docker-build:
+  build-and-push:
+    parameters:
+      moving-tag:
+        type: string
     docker:
       - image: cimg/base:stable
     steps:
@@ -132,23 +130,51 @@ jobs:
       - run:
           name: Build Docker Image
           command: |
-            docker build -t image-queue:$CIRCLE_SHA1 .
+            SHORT_SHA="${CIRCLE_SHA1:0:7}"
+            IMAGE="$DOCKERHUB_USER/image-queue"   # CHANGE ME
+            docker build \
+              -t "$IMAGE:<< parameters.moving-tag >>" \
+              -t "$IMAGE:${CIRCLE_BRANCH}-${SHORT_SHA}" .
+      - run:
+          name: Push to Docker Hub
+          command: |
+            SHORT_SHA="${CIRCLE_SHA1:0:7}"
+            IMAGE="$DOCKERHUB_USER/image-queue"   # CHANGE ME
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USER" --password-stdin
+            docker push "$IMAGE:<< parameters.moving-tag >>"
+            docker push "$IMAGE:${CIRCLE_BRANCH}-${SHORT_SHA}"
 
 workflows:
-  ci:
+  qa-pipeline:
+    when:
+      equal: [ main, << pipeline.git.branch >> ]
     jobs:
       - lint
-
+      - secret-scan
       - unit-tests
-
       - integration-tests:
           requires:
             - unit-tests
-
-      - secret-scan
-
-      - docker-build:
+      - build-and-push:
+          name: build-and-push-qa
+          moving-tag: qa
           requires:
-            - integration-tests
             - lint
             - secret-scan
+            - integration-tests
+
+  stage-pipeline:
+    when:
+      equal: [ staging, << pipeline.git.branch >> ]
+    jobs:
+      - build-and-push:
+          name: build-and-push-stage
+          moving-tag: stage
+
+  prod-pipeline:
+    when:
+      equal: [ prod, << pipeline.git.branch >> ]
+    jobs:
+      - build-and-push:
+          name: build-and-push-prod
+          moving-tag: prod
