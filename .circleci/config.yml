@@ -1,4 +1,10 @@
 
+version: 2.1
+
+orbs:
+  python: circleci/python@2.1.1
+
+jobs:
   integration-tests:
     docker:
       - image: cimg/python:3.12
@@ -30,3 +36,8 @@
       - run:
           name: Run Integration Tests
           command: pytest test_api.py test_jobs.py -v
+
+workflows:
+  test-workflow:
+    jobs:
+      - integration-tests
