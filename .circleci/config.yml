@@ -18,13 +18,45 @@ jobs:
           command: ruff check .
 
   unit-tests:
+    
+  unit-tests:
     docker:
       - image: cimg/python:3.12
+        environment:
+          DATABASE_URL: postgresql://imagequeue:local_dev_password@localhost:5432/imagequeue
+          REDIS_URL: redis://localhost:6379/0
+      - image: cimg/postgres:16.6
+        environment:
+          POSTGRES_DB: imagequeue
+          POSTGRES_USER: imagequeue
+          POSTGRES_PASSWORD: local_dev_password
+      - image: cimg/redis:7.4
     steps:
       - checkout
       - python/install-packages:
           pkg-manager: pip
           pip-dependency-file: requirements-dev.txt
+      - run:
+          name: Install PostgreSQL Client
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client
+      - run:
+          name: Wait for PostgreSQL
+          command: |
+            for i in $(seq 1 60); do
+              if pg_isready -h localhost -p 5432 -U imagequeue; then
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "PostgreSQL did not become ready"
+            exit 1
+      - run:
+          name: Initialize Database
+          command: |
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_schema.sql
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/002_seed.sql
       - run:
           name: Run Unit Tests
           command: pytest test_jobs.py -v
