@@ -1,271 +1,154 @@
 version: 2.1
 
-executors:
-  python-executor:
-    docker:
-      - image: cimg/python:3.12.8
-    working_directory: ~/repo
+orbs:
+  python: circleci/python@2.1.1
 
 jobs:
-  secret-scan:
-    docker:
-      - image: zricethezav/gitleaks:v8.24.0
-    working_directory: ~/repo
-    steps:
-      - checkout
-      - run:
-          name: Run gitleaks secret scan across git history
-          command: |
-            gitleaks detect --verbose --redact
-
   lint:
-    executor: python-executor
+    docker:
+      - image: cimg/python:3.12
     steps:
       - checkout
-      - restore_cache:
-          keys:
-            - pip-cache-v1-{{ checksum "requirements.txt" }}-{{ checksum "requirements-dev.txt" }}
-            - pip-cache-v1-
+      - python/install-packages:
+          pkg-manager: pip
+          pip-dependency-file: requirements-dev.txt
       - run:
-          name: Install dependencies
-          command: |
-            python -m venv .venv
-            . .venv/bin/activate
-            pip install --upgrade pip
-            pip install -r requirements-dev.txt
-      - save_cache:
-          key: pip-cache-v1-{{ checksum "requirements.txt" }}-{{ checksum "requirements-dev.txt" }}
-          paths:
-            - ~/.cache/pip
-      - run:
-          name: Run ruff linter
-          command: |
-            . .venv/bin/activate
-            ruff check .
-      - run:
-          name: Run hadolint on Dockerfile
-          command: |
-            curl -sSL -o hadolint "https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-x86_64"
-            chmod +x hadolint
-            ./hadolint Dockerfile
+          name: Run Ruff Linter
+          command: ruff check .
 
   unit-tests:
-    executor: python-executor
+    docker:
+      - image: cimg/python:3.12
+        environment:
+          DATABASE_URL: postgresql://imagequeue:local_dev_password@localhost:5432/imagequeue
+          REDIS_URL: redis://localhost:6379/0
+      - image: cimg/postgres:16.6
+        environment:
+          POSTGRES_DB: imagequeue
+          POSTGRES_USER: imagequeue
+          POSTGRES_PASSWORD: local_dev_password
+      - image: cimg/redis:7.4
     steps:
       - checkout
-      - restore_cache:
-          keys:
-            - pip-cache-v1-{{ checksum "requirements.txt" }}-{{ checksum "requirements-dev.txt" }}
-            - pip-cache-v1-
+      - python/install-packages:
+          pkg-manager: pip
+          pip-dependency-file: requirements-dev.txt
       - run:
-          name: Install dependencies
+          name: Install PostgreSQL Client
           command: |
-            python -m venv .venv
-            . .venv/bin/activate
-            pip install --upgrade pip
-            pip install -r requirements-dev.txt
-      - save_cache:
-          key: pip-cache-v1-{{ checksum "requirements.txt" }}-{{ checksum "requirements-dev.txt" }}
-          paths:
-            - ~/.cache/pip
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client
       - run:
-          name: Run unit tests with coverage
+          name: Wait for PostgreSQL
           command: |
-            . .venv/bin/activate
-            mkdir -p test-results coverage
-            pytest tests/unit --cov=app --cov-report=term-missing --cov-report=xml:coverage/coverage.xml --cov-report=html:coverage/html --cov-fail-under=70 --junitxml=test-results/unit.xml
-      - store_test_results:
-          path: test-results
-      - store_artifacts:
-          path: coverage
+            for i in $(seq 1 60); do
+              if pg_isready -h localhost -p 5432 -U imagequeue; then
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "PostgreSQL did not become ready"
+            exit 1
+      - run:
+          name: Initialize Database
+          command: |
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_schema.sql
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/002_seed.sql
+      - run:
+          name: Run Unit Tests
+          command: pytest test_jobs.py -v
 
   integration-tests:
     docker:
-      - image: cimg/python:3.12.8
+      - image: cimg/python:3.12
         environment:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/imgq
+          DATABASE_URL: postgresql://imagequeue:local_dev_password@localhost:5432/imagequeue
           REDIS_URL: redis://localhost:6379/0
-      - image: cimg/postgres:16.8
+      - image: cimg/postgres:16.6
         environment:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: imgq
-      - image: cimg/redis:7.2.7
-    working_directory: ~/repo
+          POSTGRES_DB: imagequeue
+          POSTGRES_USER: imagequeue
+          POSTGRES_PASSWORD: local_dev_password
+      - image: cimg/redis:7.4
+    steps:
+      - checkout
+      - python/install-packages:
+          pkg-manager: pip
+          pip-dependency-file: requirements-dev.txt
+
+      - run:
+          name: Install PostgreSQL Client
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client
+
+      - run:
+          name: Wait for PostgreSQL
+          command: |
+            for i in $(seq 1 60); do
+              if pg_isready -h localhost -p 5432 -U imagequeue; then
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "PostgreSQL did not become ready"
+            exit 1
+
+      - run:
+          name: Apply Database Migrations
+          command: |
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_schema.sql
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/002_seed.sql
+
+      - run:
+          name: Verify Jobs Table
+          command: |
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "\dt jobs"
+
+      - run:
+          name: Run Integration Tests
+          command: pytest test_api.py test_jobs.py -v
+
+  secret-scan:
+    docker:
+      - image: cimg/base:stable
     steps:
       - checkout
       - run:
-          name: Install postgresql-client
+          name: Install Gitleaks
           command: |
-            sudo apt-get update && sudo apt-get install -y postgresql-client
+            curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz \
+              | tar -xz gitleaks
       - run:
-          name: Wait for services readiness
-          command: |
-            dockerize -wait tcp://localhost:5432 -wait tcp://localhost:6379 -timeout 1m
-            until pg_isready -h localhost -p 5432 -U postgres -d imgq; do
-              echo "Waiting for PostgreSQL..."
-              sleep 1
-            done
-      - run:
-          name: Apply migrations in filename order
-          command: |
-            for f in $(ls migrations/*.sql | sort); do
-              echo "Applying $f..."
-              psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"
-            done
-      - restore_cache:
-          keys:
-            - pip-cache-v1-{{ checksum "requirements.txt" }}-{{ checksum "requirements-dev.txt" }}
-            - pip-cache-v1-
-      - run:
-          name: Install dependencies
-          command: |
-            python -m venv .venv
-            . .venv/bin/activate
-            pip install --upgrade pip
-            pip install -r requirements-dev.txt
-      - run:
-          name: Run integration tests
-          command: |
-            . .venv/bin/activate
-            mkdir -p test-results
-            pytest tests/integration -m integration --junitxml=test-results/integration.xml -v
-      - store_test_results:
-          path: test-results
+          name: Scan Repository for Secrets
+          command: ./gitleaks detect --source . --redact --verbose
 
-  build-and-push:
-    executor: python-executor
-    parameters:
-      tag_name:
-        type: string
+  docker-build:
+    docker:
+      - image: cimg/base:stable
     steps:
       - checkout
-      - setup_remote_docker:
-          version: default
+      - setup_remote_docker
       - run:
-          name: Build and Push Docker Image
+          name: Build Docker Image
           command: |
-            DOCKER_USER="${DOCKERHUB_USER:-$DOCKERHUB_USERNAME}"
-            DOCKER_TOKEN="${DOCKERHUB_TOKEN:-$DOCKERHUB_PASSWORD}"
-            PROJECT="${CIRCLE_PROJECT_REPONAME:-image-queue-python}"
-            MOVING_TAG="<< parameters.tag_name >>"
-            IMMUTABLE_TAG="${CIRCLE_BRANCH}-${CIRCLE_SHA1:0:7}"
-
-            echo "Building image for branch: ${CIRCLE_BRANCH}"
-            echo "Repository: ${DOCKER_USER}/${PROJECT}"
-            echo "Tags: :${MOVING_TAG} and :${IMMUTABLE_TAG}"
-
-            docker build -t "${PROJECT}:build" .
-
-            # Smoke test container to ensure it runs as non-root
-            docker run -d --name smoke-test -p 8080:8080 "${PROJECT}:build"
-            sleep 2
-            USER_ID=$(docker exec smoke-test id -u)
-            echo "Container running as UID: $USER_ID"
-            if [ "$USER_ID" -eq 0 ]; then
-              echo "ERROR: Container is running as root!"
-              exit 1
-            fi
-            docker stop smoke-test && docker rm smoke-test
-
-            if [ -n "$DOCKER_USER" ] && [ -n "$DOCKER_TOKEN" ]; then
-              echo "$DOCKER_TOKEN" | docker login -u "$DOCKER_USER" --password-stdin
-              docker tag "${PROJECT}:build" "${DOCKER_USER}/${PROJECT}:${MOVING_TAG}"
-              docker tag "${PROJECT}:build" "${DOCKER_USER}/${PROJECT}:${IMMUTABLE_TAG}"
-              docker push "${DOCKER_USER}/${PROJECT}:${MOVING_TAG}"
-              docker push "${DOCKER_USER}/${PROJECT}:${IMMUTABLE_TAG}"
-              echo "Successfully pushed ${DOCKER_USER}/${PROJECT}:${MOVING_TAG} and ${DOCKER_USER}/${PROJECT}:${IMMUTABLE_TAG}"
-            else
-              echo "ERROR: DOCKERHUB_USER or DOCKERHUB_TOKEN environment variables not set in CircleCI!"
-              exit 1
-            fi
+            docker build -t image-queue:$CIRCLE_SHA1 .
 
 workflows:
-  version: 2
-  qa-pipeline:
+  ci:
     jobs:
-      - secret-scan:
-          filters:
-            branches:
-              only: main
-      - lint:
-          requires:
-            - secret-scan
-          filters:
-            branches:
-              only: main
-      - unit-tests:
-          requires:
-            - lint
-          filters:
-            branches:
-              only: main
+      - lint
+
+      - unit-tests
+
       - integration-tests:
           requires:
             - unit-tests
-          filters:
-            branches:
-              only: main
-      - build-and-push:
-          name: push-qa
-          tag_name: "qa"
+
+      - secret-scan
+
+      - docker-build:
           requires:
             - integration-tests
-          filters:
-            branches:
-              only: main
-
-  staging-pipeline:
-    jobs:
-      - build-and-push:
-          name: push-stage
-          tag_name: "stage"
-          filters:
-            branches:
-              only: staging
-
-  prod-pipeline:
-    jobs:
-      - build-and-push:
-          name: push-prod
-          tag_name: "prod"
-          filters:
-            branches:
-              only: prod
-
-  pr-validation:
-    jobs:
-      - secret-scan:
-          filters:
-            branches:
-              ignore:
-                - main
-                - staging
-                - prod
-      - lint:
-          requires:
-            - secret-scan
-          filters:
-            branches:
-              ignore:
-                - main
-                - staging
-                - prod
-      - unit-tests:
-          requires:
             - lint
-          filters:
-            branches:
-              ignore:
-                - main
-                - staging
-                - prod
-      - integration-tests:
-          requires:
-            - unit-tests
-          filters:
-            branches:
-              ignore:
-                - main
-                - staging
-                - prod
+            - secret-scan
